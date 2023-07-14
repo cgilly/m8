@@ -2,6 +2,25 @@
 #include <cstring>
 #include <iostream>
 
+const std::unordered_map<int, int> display::keycodes = {
+        {65438, 0},
+        {65436, 1},
+        {65433, 2},
+        {65435, 3},
+        {65430, 4},
+        {65437, 5},
+        {65432, 6},
+        {65429, 7},
+        {65431, 8},
+        {65434, 9},
+        {97,    10},
+        {98,    11},
+        {99,    12},
+        {100,   13},
+        {101,   14},
+        {102,   15}
+};
+
 display::display(int w, int h, int pixel_size, const std::string &window_name) : pixel_size_(pixel_size), w_(w),
                                                                                  h_(h), window_name_(window_name),
                                                                                  running_(false), redraw_(false) {
@@ -35,7 +54,7 @@ int display::initialize() noexcept {
             BlackPixel(x11_display_, screen),
             BlackPixel(x11_display_, screen)
     );
-    XSelectInput(x11_display_, x11_window_, ExposureMask);
+    XSelectInput(x11_display_, x11_window_, ExposureMask | KeyPressMask | KeyReleaseMask);
     XMapWindow(x11_display_, x11_window_);
 
     // Centering the window before XMapWindow doesn't do anything
@@ -68,6 +87,13 @@ void display::loop() noexcept {
                 XGetWindowAttributes(x11_display_, x11_window_, &gwa);
                 std::cout << "Game window is " << gwa.width << "x" << gwa.height << std::endl;
                 draw_pixels();
+            } else if (event.type == KeyPress || event.type == KeyRelease) {
+                const auto keycode = static_cast<int>(XLookupKeysym(&event.xkey, 0));
+                bool is_pressed = event.type == KeyPress;
+                if (keycodes.contains(keycode)) {
+                    auto key = keycodes.at(keycode);
+                    key_pressed_[key] = is_pressed;
+                }
             }
         }
 
@@ -102,5 +128,3 @@ void display::draw_pixels() const noexcept {
 void display::terminate() noexcept {
     running_ = false;
 }
-
-

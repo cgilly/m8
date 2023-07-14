@@ -8,6 +8,8 @@
 #include <chrono>
 #include <thread>
 #include "display.h"
+#include <stack>
+#include <cstring>
 
 // Notes:
 
@@ -23,27 +25,52 @@
 //  - a 64x32 monochrome display
 
 constexpr static auto clock_freq = 7e2; // 700 Hz
-constexpr static auto display_refresh_rate = 3e1; // 30 FPS
 constexpr static uint16_t mem_size = 4096;
 constexpr static uint16_t start_addr = 0x200;
 constexpr static auto gp_registers = 16;
 constexpr static auto display_w = 64;
 constexpr static auto display_h = 32;
 constexpr static auto n_pixels = display_w * display_h;
+constexpr static auto font_sprite_size = 5; // bytes
 
 static bool cpu_running = true;
 
 struct cpu_t {
-    uint8_t ram[mem_size];
-    uint8_t register_vx[gp_registers];
-    uint8_t register_delay;
-    uint8_t register_sound;
-    uint16_t register_index;
-    uint16_t pc;
+    uint8_t ram[mem_size]{};
+    uint8_t register_vx[gp_registers]{};
+    uint8_t register_delay{};
+    uint8_t register_sound{};
+    uint16_t register_index{};
+    uint16_t pc{};
+    std::stack<uint16_t> stack;
 
-    uint8_t display[n_pixels];
-    bool redraw_required;
+    uint8_t display[n_pixels]{};
+    bool keys[16]{};
+    int last_key_pressed = -1;
+    bool redraw_required{};
 };
+
+static void set_font_sprites(cpu_t &cpu) {
+    constexpr uint8_t font_sprites[] = {
+            0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
+            0x20, 0x60, 0x20, 0x20, 0x70, // 1
+            0xF0, 0x10, 0xF0, 0x80, 0xF0, // 2
+            0xF0, 0x10, 0xF0, 0x10, 0xF0, // 3
+            0x90, 0x90, 0xF0, 0x10, 0x10, // 4
+            0xF0, 0x80, 0xF0, 0x10, 0xF0, // 5
+            0xF0, 0x80, 0xF0, 0x90, 0xF0, // 6
+            0xF0, 0x10, 0x20, 0x40, 0x40, // 7
+            0xF0, 0x90, 0xF0, 0x90, 0xF0, // 8
+            0xF0, 0x90, 0xF0, 0x10, 0xF0, // 9
+            0xF0, 0x90, 0xF0, 0x90, 0x90, // A
+            0xE0, 0x90, 0xE0, 0x90, 0xE0, // B
+            0xF0, 0x80, 0x80, 0x80, 0xF0, // C
+            0xE0, 0x90, 0x90, 0x90, 0xE0, // D
+            0xF0, 0x80, 0xF0, 0x80, 0xF0, // E
+            0xF0, 0x80, 0xF0, 0x80, 0x80, // F
+    };
+    std::memcpy(cpu.ram, font_sprites, 16 * 5);
+}
 
 static void load_rom(cpu_t &cpu, const std::string &filename) {
     std::cout << "Loading ROM: " << filename << std::endl;
@@ -64,7 +91,11 @@ static void load_rom(cpu_t &cpu, const std::string &filename) {
 
     fclose(rom);
 
-    std::cout << "ROM loaded correctly! (size = " << rom_size << ")" << std::endl;
+    std::cout << "ROM loaded correctly! (size: " << rom_size << " bytes)" << std::endl;
+}
+
+static inline void set_flag(cpu_t &cpu, bool set) noexcept {
+    cpu.register_vx[15] = static_cast<uint8_t>(set);
 }
 
 
@@ -79,12 +110,19 @@ static void execute(cpu_t &cpu, uint16_t instruction) noexcept {
     switch (ms_nibble) {
         case 0x00: {
             if (imm_nn == 0xE0) {
+                // Clear display
                 for (auto &p: cpu.display)
                     p = 0;
                 cpu.redraw_required = true;
             }
             if (imm_nn == 0xEE) {
                 // Return from subroutine
+                if (!cpu.stack.empty()) {
+                    cpu.pc = cpu.stack.top();
+                    cpu.stack.pop();
+                } else {
+                    std::cerr << "[warning] 00EE called before 2NNN" << std::endl;
+                }
             }
             break;
         }
@@ -95,7 +133,8 @@ static void execute(cpu_t &cpu, uint16_t instruction) noexcept {
         }
         case 0x02: {
             // 2NNN: execute subroutine at address NNN
-            std::cout << "2NNN" << std::endl;
+            cpu.stack.push(cpu.pc);
+            cpu.pc = imm_nnn;
             break;
         }
         case 0x03: {
@@ -133,7 +172,72 @@ static void execute(cpu_t &cpu, uint16_t instruction) noexcept {
             break;
         }
         case 0x08: {
-            std::cout << "8XY_" << std::endl;
+            // The last nibble is used to identify the actual instruction
+            switch (imm_n) {
+                case 0x00: {
+                    // 8XY0: store the value of register Y in register X
+                    cpu.register_vx[reg_x] = cpu.register_vx[reg_y];
+                    break;
+                }
+                case 0x01: {
+                    // 8XY1: store the value of register X to register Y OR X
+                    cpu.register_vx[reg_x] |= cpu.register_vx[reg_y];
+                    break;
+                }
+                case 0x02: {
+                    // 8XY2: store the value of register X to register Y AND X
+                    cpu.register_vx[reg_x] &= cpu.register_vx[reg_y];
+                    break;
+                }
+                case 0x03: {
+                    // 8XY3: store the value of register X to register Y XOR X
+                    cpu.register_vx[reg_x] ^= cpu.register_vx[reg_y];
+                    break;
+                }
+                case 0x04: {
+                    // 8XY4: VX += VY; VF = 1 if overflow
+                    const auto x_val = static_cast<int>(cpu.register_vx[reg_x]);
+                    const auto y_val = static_cast<int>(cpu.register_vx[reg_y]);
+                    set_flag(cpu, x_val + y_val > 255);
+
+                    cpu.register_vx[reg_x] += y_val;
+                    break;
+                }
+                case 0x05: {
+                    // 8XY5: VX -= VY; VF = 1 if borrow
+                    const auto x_val = static_cast<int>(cpu.register_vx[reg_x]);
+                    const auto y_val = static_cast<int>(cpu.register_vx[reg_y]);
+                    set_flag(cpu, x_val < y_val);
+
+                    cpu.register_vx[reg_x] -= y_val;
+                    break;
+                }
+                case 0x06: {
+                    // 8XY6: VX = VY >> 1; VF = old_VY & 1
+                    const auto y_val = static_cast<int>(cpu.register_vx[reg_y]);
+                    set_flag(cpu, y_val & 0x01);
+
+                    cpu.register_vx[reg_x] = static_cast<uint8_t>(y_val >> 1);
+                    break;
+                }
+                case 0x07: {
+                    // 8XY7: VX = VY - VX; VF = 1 if borrow
+                    const auto x_val = static_cast<int>(cpu.register_vx[reg_x]);
+                    const auto y_val = static_cast<int>(cpu.register_vx[reg_y]);
+                    set_flag(cpu, y_val < x_val);
+
+                    cpu.register_vx[reg_x] = y_val - x_val;
+                    break;
+                }
+                case 0x0E: {
+                    // 8XYE: VX = VY << 1; VF = old_VY & 1
+                    const auto y_val = static_cast<int>(cpu.register_vx[reg_y]);
+                    set_flag(cpu, y_val & 0x01);
+
+                    cpu.register_vx[reg_x] = static_cast<uint8_t>(y_val << 1);
+                    break;
+                }
+            }
             break;
         }
         case 0x09: {
@@ -151,13 +255,13 @@ static void execute(cpu_t &cpu, uint16_t instruction) noexcept {
         }
         case 0x0B: {
             // BNNN: jump at address NNN + V0
-            auto addr = static_cast<uint16_t>(imm_nnn + cpu.register_vx[0]);
+            const auto addr = static_cast<uint16_t>(imm_nnn + cpu.register_vx[0]);
             cpu.pc = addr;
             break;
         }
         case 0x0C: {
             // CXNN: set register X to a random value masked with NN
-            uint8_t rand_value = std::rand() % 256;
+            auto rand_value = static_cast<uint8_t>(std::rand() % 256);
             rand_value &= imm_nn;
             cpu.register_vx[reg_x] = rand_value;
             break;
@@ -187,11 +291,98 @@ static void execute(cpu_t &cpu, uint16_t instruction) noexcept {
             break;
         }
         case 0x0E: {
-            std::cout << "EX__" << std::endl;
+            switch (imm_nn) {
+                case 0x9E: {
+                    // EX9E: skip the following instruction if the key corresponding to the hex value stored in register X is pressed
+                    const auto x_val = cpu.register_vx[reg_x];
+                    if (x_val < 16) {
+                        if (cpu.keys[x_val])
+                            cpu.pc += 2;
+                    }
+                    break;
+                }
+                case 0xA1: {
+                    // EXA1: skip the following instruction if the key corresponding to the hex value stored in register X is not pressed
+                    const auto x_val = cpu.register_vx[reg_x];
+                    if (x_val < 16) {
+                        if (!cpu.keys[x_val])
+                            cpu.pc += 2;
+                    }
+                    break;
+                }
+            }
             break;
         }
         case 0x0F: {
-            std::cout << "FX__" << std::endl;
+            // FX-type instructions are identified by the last byte (imm_nn)
+            switch (imm_nn) {
+                case 0x07: {
+                    // FX07: store the current value of the delay timer in register X
+                    cpu.register_vx[reg_x] = cpu.register_delay;
+                    break;
+                }
+                case 0x0A: {
+                    // FX0A: wait for a keypress and store it in register X
+                    if (cpu.last_key_pressed < 0) {
+                        cpu.pc -= 2;
+                    } else {
+                        cpu.register_vx[reg_x] = static_cast<uint8_t>(cpu.last_key_pressed);
+                    }
+                    break;
+                }
+                case 0x15: {
+                    // FX15: set the delay timer to the value of register X
+                    cpu.register_delay = cpu.register_vx[reg_x];
+                    break;
+                }
+                case 0x18: {
+                    // FX18: set the sound timer to the value of register X
+                    cpu.register_sound = cpu.register_vx[reg_x];
+                    break;
+                }
+                case 0x1E: {
+                    // FX1E: add the value stored in register X to register I
+                    cpu.register_index += cpu.register_vx[reg_x];
+                    break;
+                }
+                case 0x29: {
+                    // FX29: set register I to the memory address of the sprite data corresponding to hex digit in register X
+                    const auto digit = cpu.register_vx[reg_x];
+                    cpu.register_index = digit * font_sprite_size;
+                    break;
+                }
+                case 0x33: {
+                    // FX33: store the BCD equivalent of the value stored in register X at addresses I, I+1, I+2
+                    const auto x_val = cpu.register_vx[reg_x];
+                    const uint8_t c = x_val / 100;
+                    const int mod100 = x_val % 100;
+                    const uint8_t d = mod100 / 10;
+                    const uint8_t u = mod100 % 10;
+
+                    cpu.ram[cpu.register_index] = c;
+                    cpu.ram[cpu.register_index + 1] = d;
+                    cpu.ram[cpu.register_index + 2] = u;
+                    break;
+                }
+                case 0x55: {
+                    // FX55: store the value of registers 0 to X inclusive in memory starting from I then set I = I + X + 1
+                    for (auto i = 0; i <= reg_x; ++i) {
+                        cpu.ram[cpu.register_index + i] = cpu.register_vx[i];
+                    }
+                    cpu.register_index += (reg_x + 1);
+                    break;
+                }
+                case 0x65: {
+                    // FX65: fill registers 0 to X inclusive with the values stored in memory starting from I then set I = I + X + 1
+                    for (auto i = 0; i <= reg_x; ++i) {
+                        cpu.register_vx[i] = cpu.ram[cpu.register_index + i];
+                    }
+                    cpu.register_index += (reg_x + 1);
+                    break;
+                }
+
+
+            }
             break;
         }
     }
@@ -209,10 +400,44 @@ static inline microseconds now() noexcept {
 }
 
 
-int main() {
+static std::string parse_cli(int argc, char **argv) {
+    constexpr static auto usage = "Usage is: emu --rom=<path/to/rom>";
+    if (argc != 2) {
+        std::cerr << usage << std::endl;
+        exit(1);
+    }
+
+    std::string rom_opt = argv[1];
+    std::string rom;
+    if (rom_opt.starts_with("--")) {
+        auto pos = rom_opt.find('=');
+        if (pos != std::string::npos) {
+            const auto opt_name = rom_opt.substr(2, pos - 2);
+            const auto opt_val = rom_opt.substr(pos + 1);
+            if (opt_name != "rom") {
+                std::cerr << "Wrong option, expected rom, found " << opt_name << "\n" << usage << std::endl;
+                exit(1);
+            }
+            rom = opt_val;
+        } else {
+            std::cerr << "Invalid option format: " << rom_opt << "\n" << usage << std::endl;
+            exit(1);
+        }
+    } else {
+        std::cout << "Unknown option: " << rom_opt << "\n" << usage << std::endl;
+        exit(1);
+    }
+    return rom;
+}
+
+
+int main(int argc, char **argv) {
+    const auto rom = parse_cli(argc, argv);
+
     signal(SIGINT, on_interrupt);
 
     cpu_t cpu{};
+    set_font_sprites(cpu);
     // Initialize the display
     display the_display{display_w, display_h, 10, "CHIP-8"};
     the_display.initialize();
@@ -221,7 +446,7 @@ int main() {
         the_display.loop();
     }};
 
-    load_rom(cpu, "testroms/ibm-logo.ch8");
+    load_rom(cpu, rom);
 
     // Prepare random number generator
     std::srand(std::time(nullptr));
@@ -231,9 +456,11 @@ int main() {
     uint16_t next_instruction;
 
     constexpr static auto clock_period_us = static_cast<int>((1. / clock_freq) * 1000 * 1000);
-    constexpr static auto clocks_per_refresh_cycle = static_cast<size_t>(clock_freq / display_refresh_rate);
+    constexpr static auto clocks60 = static_cast<size_t>(clock_freq / 60.);
 
     size_t clk = 0;
+    bool tmp_keys[16];
+    bool something_pressed = false;
     while (cpu_running) {
         const auto start = now();
         next_instruction = (cpu.ram[cpu.pc] << 8) | (cpu.ram[cpu.pc + 1]);
@@ -243,11 +470,37 @@ int main() {
 
         clk++;
 
-        // Check if a redraw is needed
-        if ((clk % clocks_per_refresh_cycle) == 0 && cpu.redraw_required) {
-            cpu.redraw_required = false;
-            the_display.request_redraw(cpu.display);
+        if ((clk % clocks60) == 0) {
+            // In here we can do everything that needs to be done 60 times a second
+            if (cpu.redraw_required) {
+                cpu.redraw_required = false;
+                the_display.request_redraw(cpu.display);
+            }
+
+            // Decrement sound and delay timers
+            if (cpu.register_delay > 0)
+                cpu.register_delay--;
+
+            if (cpu.register_sound > 0)
+                cpu.register_sound--;
         }
+        // Fetch the current input status
+        the_display.get_keyboard(tmp_keys);
+        // Check if something changed from the last clock cycle
+        for (auto i = 0; i < 16; ++i) {
+            if (tmp_keys[i] && !cpu.keys[i]) {
+                // Then the user pressed key i
+                cpu.last_key_pressed = i;
+                something_pressed = true;
+                break;
+            }
+        }
+
+        if (!something_pressed) {
+            cpu.last_key_pressed = -1;
+        }
+        std::memcpy(cpu.keys, tmp_keys, 16 * sizeof(bool));
+
         const auto stop = now();
         const auto period_us = (stop - start).count();
         if (period_us < clock_period_us) {

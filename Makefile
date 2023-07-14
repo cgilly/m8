@@ -1,5 +1,5 @@
 CXX			= g++
-CXXFLAGS 	= -std=c++20 -Wall -Wextra -Wpedantic -g
+CXXFLAGS 	= -std=c++20 -Wall -Wextra -Wpedantic -Wcast-qual -g
 LDFLAGS		= -lX11
 
 all: clean emu
